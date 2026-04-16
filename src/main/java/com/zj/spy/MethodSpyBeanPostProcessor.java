@@ -1,14 +1,22 @@
 package com.zj.spy;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.springframework.beans.BeansException;
+import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.core.Ordered;
 import org.springframework.core.PriorityOrdered;
+import org.springframework.web.context.request.RequestAttributes;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
+import jakarta.servlet.http.HttpServletRequest;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
-import java.lang.reflect.Proxy;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -23,21 +31,29 @@ import java.util.Locale;
  */
 class MethodSpyBeanPostProcessor implements BeanPostProcessor, PriorityOrdered {
     private static final DateTimeFormatter DATE_TIME_FORMATTER =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final ObjectMapper PRETTY_JSON_MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
     @Override
     public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
         Class<?> targetClass = bean.getClass();
-        Class<?>[] interfaces = targetClass.getInterfaces();
-        if (interfaces.length == 0 || !containsSpyMethod(targetClass)) {
+        if (!containsSpyMethod(targetClass)) {
             return bean;
         }
 
-        return Proxy.newProxyInstance(
-                targetClass.getClassLoader(),
-                interfaces,
-                (proxy, method, args) -> invokeWithSpy(bean, method, args)
+        ProxyFactory proxyFactory = new ProxyFactory(bean);
+        Class<?>[] interfaces = targetClass.getInterfaces();
+        if (interfaces.length > 0) {
+            proxyFactory.setInterfaces(interfaces);
+        } else {
+            proxyFactory.setProxyTargetClass(true);
+        }
+        proxyFactory.addAdvice((org.aopalliance.intercept.MethodInterceptor) invocation ->
+                invokeWithSpy(bean, invocation.getMethod(), invocation.getArguments())
         );
+        return proxyFactory.getProxy();
     }
 
     @Override
@@ -57,9 +73,14 @@ class MethodSpyBeanPostProcessor implements BeanPostProcessor, PriorityOrdered {
 
         Object[] safeArgs = args == null ? new Object[0] : args;
         long startNs = System.nanoTime();
-        Object result = invokeTarget(bean, targetMethod, args);
-        printPrettyLog(targetMethod, safeArgs, result, startNs);
-        return result;
+        try {
+            Object result = invokeTarget(bean, targetMethod, args);
+            printPrettyLog(targetMethod, safeArgs, result, startNs);
+            return result;
+        } catch (Throwable e) {
+            printErrorLog(targetMethod, safeArgs, e, startNs);
+            throw e;
+        }
     }
 
     private Object invokeTarget(Object bean, Method method, Object[] args) throws Throwable {
@@ -86,21 +107,49 @@ class MethodSpyBeanPostProcessor implements BeanPostProcessor, PriorityOrdered {
         String timestamp = LocalDateTime.now().format(DATE_TIME_FORMATTER);
 
         System.out.println("🔹 [" + timestamp + "] 🔹");
-        System.out.println("   ▶ 方法: " + method.getName());
+        System.out.println("   ▶ 路径: " + resolveInvocationPath(method));
         System.out.println("   ▶ 参数: " + formatArgs(method.getParameters(), args, maskFields));
-        System.out.println("   ▶ 结果: " + result + " (success)");
+        System.out.println("   ▶ 结果: " + formatValue(result));
         System.out.println("   ◀ 耗时: " + durationMs + "ms");
         System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
+    private void printErrorLog(Method method, Object[] args, Throwable error, long startNs) {
+        MethodSpy config = method.getAnnotation(MethodSpy.class);
+        String[] maskFields = config == null ? new String[0] : config.maskFields();
+        long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
+        String timestamp = LocalDateTime.now().format(DATE_TIME_FORMATTER);
+
+        System.out.println("🔹 [" + timestamp + "] 🔹");
+        System.out.println("   ▶ 路径: " + resolveInvocationPath(method));
+        System.out.println("   ▶ 参数: " + formatArgs(method.getParameters(), args, maskFields));
+        System.out.println("   ▶ 异常: " + error.getClass().getSimpleName() + " - " + error.getMessage());
+        System.out.println("   ◀ 耗时: " + durationMs + "ms");
+        System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    }
+
+    private String resolveInvocationPath(Method method) {
+        RequestAttributes requestAttributes = RequestContextHolder.getRequestAttributes();
+        if (requestAttributes instanceof ServletRequestAttributes servletRequestAttributes) {
+            HttpServletRequest request = servletRequestAttributes.getRequest();
+            String queryString = request.getQueryString();
+            String requestPath = request.getRequestURI();
+            if (queryString != null && !queryString.isBlank()) {
+                requestPath = requestPath + "?" + queryString;
+            }
+            return request.getMethod() + " " + requestPath;
+        }
+        return method.getDeclaringClass().getSimpleName() + "#" + method.getName();
+    }
+
     private String formatArgs(Parameter[] parameters, Object[] args, String[] maskFields) {
         if (args.length == 0) {
-            return "(none)";
+            return "无参数";
         }
         List<String> parts = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             String name = i < parameters.length ? parameters[i].getName() : ("arg" + i);
-            Object value = isMaskedField(name, maskFields) ? "\"******\"" : quoteIfString(args[i]);
+            Object value = isMaskedField(name, maskFields) ? "\"******\"" : formatValue(args[i]);
             parts.add(name + " = " + value);
         }
         return String.join(", ", parts);
@@ -116,10 +165,21 @@ class MethodSpyBeanPostProcessor implements BeanPostProcessor, PriorityOrdered {
         return false;
     }
 
-    private Object quoteIfString(Object value) {
-        if (value instanceof String) {
-            return "\"" + value + "\"";
+    private String formatValue(Object value) {
+        if (value == null) {
+            return "null";
         }
-        return value;
+        if (value instanceof CharSequence || value instanceof Number || value instanceof Boolean || value instanceof Character) {
+            if (value instanceof String || value instanceof Character) {
+                return "\"" + value + "\"";
+            }
+            return String.valueOf(value);
+        }
+        try {
+            return PRETTY_JSON_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            // 兜底：序列化失败时至少保证日志可读，不影响主流程。
+            return String.valueOf(value);
+        }
     }
 }
